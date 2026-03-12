@@ -132,6 +132,12 @@ def parse_args():
     perf_group = parser.add_argument_group("Performance options")
     perf_group.add_argument("--num-gpus", type=int, default=1, help="Number of GPUs to use")
     perf_group.add_argument(
+        "--no-cpu-offload",
+        action="store_true",
+        help="Disable all CPU offload (load everything on GPU). "
+        "Use when GPU VRAM is sufficient but system RAM is limited.",
+    )
+    perf_group.add_argument(
         "--text-encoder-cpu-offload",
         action="store_true",
         help="Offload text encoder to CPU to save GPU VRAM",
@@ -325,10 +331,17 @@ def main():
         model_path=args.model_path,
         num_gpus=args.num_gpus,
     )
-    if args.text_encoder_cpu_offload:
-        server_kwargs["text_encoder_cpu_offload"] = True
-    if args.pin_cpu_memory:
-        server_kwargs["pin_cpu_memory"] = True
+    if args.no_cpu_offload:
+        server_kwargs["dit_cpu_offload"] = False
+        server_kwargs["text_encoder_cpu_offload"] = False
+        server_kwargs["vae_cpu_offload"] = False
+        server_kwargs["pin_cpu_memory"] = False
+        logger.info("CPU offload disabled — all weights will be loaded on GPU")
+    else:
+        if args.text_encoder_cpu_offload:
+            server_kwargs["text_encoder_cpu_offload"] = True
+        if args.pin_cpu_memory:
+            server_kwargs["pin_cpu_memory"] = True
     if args.lora_path:
         server_kwargs["lora_path"] = args.lora_path
 
