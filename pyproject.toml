@@ -1,0 +1,20 @@
+[project]
+name = "aigc-infer"
+version = "0.1.0"
+description = "Qwen Image T2I & Edit inference with SGLang Diffusion"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "sglang[diffusion]",
+    "torch",
+    "Pillow",
+    "pybase64>=1.4.3",
+    "pydantic>=2.13.0b2",
+]
+
+[tool.uv]
+prerelease = "allow"
+required-environments = [
+    "sys_platform == 'linux'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
