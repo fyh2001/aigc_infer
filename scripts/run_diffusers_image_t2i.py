@@ -28,8 +28,10 @@ Usage examples:
 """
 
 import argparse
+import gzip
 import json
 import logging
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -110,6 +112,8 @@ def parse_args():
     perf_group = parser.add_argument_group("Performance options")
     perf_group.add_argument("--cpu-offload", action="store_true", help="Enable model CPU offload")
     perf_group.add_argument("--device", type=str, default=None, help="Device (auto-detected if not set)")
+    perf_group.add_argument("--torch-compile", action="store_true", help="Apply torch.compile to the transformer for faster inference")
+    perf_group.add_argument("--attention-backend", type=str, default=None, help="Attention backend (e.g. flash_attn, sage_attn)")
 
     prof_group = parser.add_argument_group("Profiler options")
     prof_group.add_argument("--profile", action="store_true", help="Enable torch.profiler")
@@ -155,6 +159,10 @@ def _load_pipeline(args, device):
         logger.info("Model CPU offload enabled")
     else:
         pipeline.to(device)
+
+    if args.torch_compile:
+        logger.info("Compiling transformer with torch.compile (mode=max-autotune-no-cudagraphs)...")
+        pipeline.transformer = torch.compile(pipeline.transformer, mode="max-autotune-no-cudagraphs")
 
     return pipeline
 
@@ -228,15 +236,17 @@ def _print_profiler_summary(prof, args, trace_path):
 
     key_metrics = []
     for evt in prof.key_averages():
+        cuda_total = getattr(evt, "cuda_time_total", 0)
+        self_cuda = getattr(evt, "self_cuda_time_total", 0)
         key_metrics.append({
             "name": evt.key,
             "count": evt.count,
             "cpu_time_total_us": evt.cpu_time_total,
-            "cuda_time_total_us": evt.cuda_time_total,
+            "cuda_time_total_us": cuda_total,
             "cpu_time_avg_us": evt.cpu_time_total / max(evt.count, 1),
-            "cuda_time_avg_us": evt.cuda_time_total / max(evt.count, 1),
+            "cuda_time_avg_us": cuda_total / max(evt.count, 1),
             "self_cpu_time_us": evt.self_cpu_time_total,
-            "self_cuda_time_us": evt.self_cuda_time_total,
+            "self_cuda_time_us": self_cuda,
         })
     key_metrics.sort(key=lambda x: x["cuda_time_total_us"], reverse=True)
 
@@ -290,7 +300,8 @@ def main():
 
     all_wall_times = []
     for ri in range(args.profile_repeat):
-        trace_path = trace_dir / f"diffusers_t2i_trace_run{ri}.json"
+        trace_json = trace_dir / f"diffusers_t2i_trace_run{ri}.json"
+        trace_gz = trace_dir / f"diffusers_t2i_trace_run{ri}.json.gz"
         logger.info("[Profile run %d/%d] tracing...", ri + 1, args.profile_repeat)
 
         with profile(
@@ -307,7 +318,11 @@ def main():
                 )
 
         all_wall_times.append(wall_time)
-        prof.export_chrome_trace(str(trace_path))
+        prof.export_chrome_trace(str(trace_json))
+        with open(trace_json, "rb") as f_in, gzip.open(trace_gz, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
+        trace_json.unlink()
+        trace_path = trace_gz
         logger.info("  Chrome trace saved to: %s", trace_path)
 
         if args.profile_summary:

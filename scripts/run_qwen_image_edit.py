@@ -36,30 +36,21 @@ Usage examples:
       --prompt "Make the sky sunset colors." \
       --text-encoder-cpu-offload
 
-  # Profile performance bottlenecks
+  # Profile performance (SGLang built-in profiler)
   python run_qwen_image_edit.py \
       --model-path Qwen/Qwen-Image-Edit-2511 \
       --image-path input.jpg \
       --prompt "Add snow to the scene." \
-      --profile --profile-dir ./profiler_traces
-
-  # Warmup before profiling for stable measurements
-  python run_qwen_image_edit.py \
-      --model-path Qwen/Qwen-Image-Edit-2511 \
-      --image-path input.jpg \
-      --prompt "Add snow to the scene." \
-      --profile --profile-warmup 1 --profile-repeat 3
+      --profile --profile-all-stages
 """
 
 import argparse
-import json
 import logging
 import sys
 import time
 from pathlib import Path
 
 import torch
-from torch.profiler import ProfilerActivity, profile, record_function
 
 from sglang.multimodal_gen import DiffGenerator
 
@@ -147,51 +138,45 @@ def parse_args():
         action="store_true",
         help="Pin CPU memory for faster data transfer",
     )
+    perf_group.add_argument(
+        "--enable-torch-compile",
+        action="store_true",
+        help="Enable torch.compile on the DiT model for faster inference",
+    )
+    perf_group.add_argument(
+        "--attention-backend",
+        type=str,
+        default=None,
+        help="Attention backend to use (e.g. flash_attn, sage_attn)",
+    )
+    perf_group.add_argument(
+        "--warmup-engine",
+        action="store_true",
+        help="Run a warmup pass through the engine before generation",
+    )
 
     prof_group = parser.add_argument_group("Profiler options")
     prof_group.add_argument(
         "--profile",
         action="store_true",
-        help="Enable torch.profiler to trace CPU/CUDA performance",
+        help="Enable SGLang built-in profiler (torch.profiler inside worker)",
     )
     prof_group.add_argument(
-        "--profile-dir",
-        type=str,
-        default="./profiler_traces",
-        help="Directory to save profiler trace files",
+        "--profile-all-stages",
+        action="store_true",
+        help="Profile all stages (text encode, denoise, VAE decode)",
+    )
+    prof_group.add_argument(
+        "--num-profiled-timesteps",
+        type=int,
+        default=None,
+        help="Number of denoising timesteps to profile (default: all)",
     )
     prof_group.add_argument(
         "--profile-warmup",
         type=int,
         default=0,
-        help="Number of warmup runs before the profiled run (not traced)",
-    )
-    prof_group.add_argument(
-        "--profile-repeat",
-        type=int,
-        default=1,
-        help="Number of profiled runs (each produces a separate trace)",
-    )
-    prof_group.add_argument(
-        "--profile-with-stack",
-        action="store_true",
-        help="Record Python & C++ call stacks (larger trace, more detail)",
-    )
-    prof_group.add_argument(
-        "--profile-memory",
-        action="store_true",
-        help="Track CUDA memory allocation/deallocation events",
-    )
-    prof_group.add_argument(
-        "--profile-summary",
-        action="store_true",
-        help="Print a table summary of top operators to stdout",
-    )
-    prof_group.add_argument(
-        "--profile-summary-top-n",
-        type=int,
-        default=30,
-        help="Number of top operators to show in the summary table",
+        help="Number of warmup runs (without profiling) before the profiled run",
     )
 
     return parser.parse_args()
@@ -218,6 +203,12 @@ def _build_sampling_kwargs(args) -> dict:
         sampling_kwargs["guidance_scale"] = args.cfg_scale
     if args.output_file_name is not None:
         sampling_kwargs["output_file_name"] = args.output_file_name
+    if args.profile:
+        sampling_kwargs["profile"] = True
+    if args.profile_all_stages:
+        sampling_kwargs["profile_all_stages"] = True
+    if args.num_profiled_timesteps is not None:
+        sampling_kwargs["num_profiled_timesteps"] = args.num_profiled_timesteps
     return sampling_kwargs
 
 
@@ -244,71 +235,21 @@ def _run_generate(generator, sampling_kwargs, run_label="Generate"):
         len(results) / elapsed if elapsed > 0 else 0,
     )
     for i, r in enumerate(results):
-        engine_time = r.generation_time or 0
+        if isinstance(r, dict):
+            engine_time = r.get("generation_time", 0) or 0
+            output_path = r.get("output_file_path", "N/A")
+        else:
+            engine_time = r.generation_time or 0
+            output_path = r.output_file_path
         logger.info(
             "[%s]   #%d  engine_time=%.3fs  wall_time=%.3fs  saved=%s",
             run_label,
             i + 1,
             engine_time,
             elapsed,
-            r.output_file_path,
+            output_path,
         )
     return results, elapsed
-
-
-def _print_profiler_summary(prof, args, trace_path):
-    """Print operator-level summary tables and save the Chrome trace."""
-    separator = "=" * 80
-
-    print(f"\n{separator}")
-    print("PROFILER SUMMARY — Top CUDA operators by total CUDA time")
-    print(separator)
-    print(
-        prof.key_averages().table(
-            sort_by="cuda_time_total",
-            row_limit=args.profile_summary_top_n,
-        )
-    )
-
-    print(f"\n{separator}")
-    print("PROFILER SUMMARY — Top CPU operators by total CPU time")
-    print(separator)
-    print(
-        prof.key_averages().table(
-            sort_by="cpu_time_total",
-            row_limit=args.profile_summary_top_n,
-        )
-    )
-
-    if args.profile_memory:
-        print(f"\n{separator}")
-        print("PROFILER SUMMARY — Top operators by CUDA memory usage")
-        print(separator)
-        print(
-            prof.key_averages().table(
-                sort_by="self_cuda_memory_usage",
-                row_limit=args.profile_summary_top_n,
-            )
-        )
-
-    key_metrics = []
-    for evt in prof.key_averages():
-        key_metrics.append({
-            "name": evt.key,
-            "count": evt.count,
-            "cpu_time_total_us": evt.cpu_time_total,
-            "cuda_time_total_us": evt.cuda_time_total,
-            "cpu_time_avg_us": evt.cpu_time_total / max(evt.count, 1),
-            "cuda_time_avg_us": evt.cuda_time_total / max(evt.count, 1),
-            "self_cpu_time_us": evt.self_cpu_time_total,
-            "self_cuda_time_us": evt.self_cuda_time_total,
-        })
-    key_metrics.sort(key=lambda x: x["cuda_time_total_us"], reverse=True)
-
-    metrics_path = trace_path.with_suffix(".metrics.json")
-    with open(metrics_path, "w") as f:
-        json.dump(key_metrics[:args.profile_summary_top_n * 2], f, indent=2)
-    print(f"\nMetrics JSON saved to: {metrics_path}")
 
 
 def main():
@@ -320,11 +261,12 @@ def main():
     logger.info("Model:   %s", args.model_path)
     logger.info("Image:   %s", args.image_path)
     logger.info("Prompt:  %s", args.prompt)
+    if args.enable_torch_compile:
+        logger.info("torch.compile:  ON")
+    if args.attention_backend:
+        logger.info("Attention:  %s", args.attention_backend)
     if args.profile:
-        logger.info("Profiler:  ON  (warmup=%d, repeat=%d)", args.profile_warmup, args.profile_repeat)
-        logger.info("  trace dir:   %s", args.profile_dir)
-        logger.info("  with_stack:  %s", args.profile_with_stack)
-        logger.info("  memory:      %s", args.profile_memory)
+        logger.info("Profiler:  ON  (SGLang built-in, profile_all_stages=%s)", args.profile_all_stages)
     logger.info("=" * 60)
 
     server_kwargs = dict(
@@ -344,6 +286,12 @@ def main():
             server_kwargs["pin_cpu_memory"] = True
     if args.lora_path:
         server_kwargs["lora_path"] = args.lora_path
+    if args.enable_torch_compile:
+        server_kwargs["enable_torch_compile"] = True
+    if args.attention_backend:
+        server_kwargs["attention_backend"] = args.attention_backend
+    if args.warmup_engine:
+        server_kwargs["warmup_engine"] = True
 
     logger.info("Loading model...")
     model_load_t0 = time.perf_counter()
@@ -354,67 +302,21 @@ def main():
     try:
         sampling_kwargs = _build_sampling_kwargs(args)
 
-        if not args.profile:
-            results, elapsed = _run_generate(generator, sampling_kwargs, run_label="Run")
-            if not results:
-                logger.error("Generation failed, no output produced.")
-                sys.exit(1)
-            logger.info("-" * 60)
-            logger.info("Summary: model_load=%.3fs  generate=%.3fs  total=%.3fs",
-                        model_load_elapsed, elapsed, model_load_elapsed + elapsed)
-            return
+        if args.profile and args.profile_warmup > 0:
+            warmup_kwargs = {k: v for k, v in sampling_kwargs.items()
+                            if k not in ("profile", "profile_all_stages", "num_profiled_timesteps")}
+            for wi in range(args.profile_warmup):
+                _run_generate(generator, warmup_kwargs,
+                              run_label=f"Warmup {wi + 1}/{args.profile_warmup}")
+            logger.info("Warmup complete, starting profiled run.")
 
-        # --- Profiling mode ---
-        trace_dir = Path(args.profile_dir)
-        trace_dir.mkdir(parents=True, exist_ok=True)
-
-        for wi in range(args.profile_warmup):
-            _run_generate(generator, sampling_kwargs, run_label=f"Warmup {wi + 1}/{args.profile_warmup}")
-        if args.profile_warmup:
-            logger.info("Warmup complete.")
-
-        activities = [ProfilerActivity.CPU]
-        if torch.cuda.is_available():
-            activities.append(ProfilerActivity.CUDA)
-
-        all_wall_times = []
-        for ri in range(args.profile_repeat):
-            trace_path = trace_dir / f"trace_run{ri}.json"
-            logger.info("[Profile run %d/%d] tracing...", ri + 1, args.profile_repeat)
-
-            with profile(
-                activities=activities,
-                record_shapes=True,
-                profile_memory=args.profile_memory,
-                with_stack=args.profile_with_stack,
-                with_flops=True,
-            ) as prof:
-                with record_function("qwen_image_edit_generate"):
-                    results, wall_time = _run_generate(
-                        generator, sampling_kwargs,
-                        run_label=f"Profile {ri + 1}/{args.profile_repeat}",
-                    )
-
-            all_wall_times.append(wall_time)
-            prof.export_chrome_trace(str(trace_path))
-            logger.info("  Chrome trace saved to: %s", trace_path)
-            logger.info("  -> Open in: chrome://tracing  or  https://ui.perfetto.dev")
-
-            if args.profile_summary:
-                _print_profiler_summary(prof, args, trace_path)
-
-        if len(all_wall_times) > 1:
-            avg_t = sum(all_wall_times) / len(all_wall_times)
-            min_t = min(all_wall_times)
-            max_t = max(all_wall_times)
-            logger.info("-" * 60)
-            logger.info(
-                "Profile timing: avg=%.3fs  min=%.3fs  max=%.3fs  over %d runs",
-                avg_t, min_t, max_t, len(all_wall_times),
-            )
-
-        if not args.profile_summary:
-            logger.info("Tip: add --profile-summary to print operator-level tables to stdout.")
+        results, elapsed = _run_generate(generator, sampling_kwargs, run_label="Run")
+        if not results:
+            logger.error("Generation failed, no output produced.")
+            sys.exit(1)
+        logger.info("-" * 60)
+        logger.info("Summary: model_load=%.3fs  generate=%.3fs  total=%.3fs",
+                    model_load_elapsed, elapsed, model_load_elapsed + elapsed)
 
     finally:
         generator.shutdown()
